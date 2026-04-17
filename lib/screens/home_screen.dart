@@ -1,7 +1,13 @@
+import 'dart:io' show Platform;
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:google_sign_in/google_sign_in.dart';
 import 'package:googleapis/drive/v3.dart' as drive;
+import 'package:googleapis_auth/auth_io.dart' as auth_io;
+import 'package:url_launcher/url_launcher.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../utils/google_auth_client.dart';
 import 'player_screen.dart';
@@ -17,10 +23,12 @@ class HomeScreen extends StatefulWidget {
 
 class _HomeScreenState extends State<HomeScreen> {
   final GoogleSignIn _googleSignIn = GoogleSignIn.instance;
-  GoogleSignInAccount? _currentUser;
-  bool _isInitialized = false;
 
-  // We now keep a master list, and a filtered list for the UI
+  bool _isInitialized = false;
+  bool _isAuthenticated = false;
+  String? _accessToken;
+  auth_io.AuthClient? _desktopAuthClient;
+
   List<drive.File> _allVideoFiles = [];
   List<drive.File> _displayedFiles = [];
   bool _isLoadingVideos = false;
@@ -30,75 +38,138 @@ class _HomeScreenState extends State<HomeScreen> {
 
   final List<String> _scopes = [drive.DriveApi.driveReadonlyScope];
 
+  bool get _isDesktop => !kIsWeb && (Platform.isWindows || Platform.isMacOS || Platform.isLinux);
+
   @override
   void initState() {
     super.initState();
-    _initGoogleSignIn();
+    _initAuth();
   }
 
-  // Helper to remove file extensions (e.g. .mp4, .mkv)
   String _cleanName(String? name) {
     if (name == null) return 'Unknown Video';
     return name.replaceAll(RegExp(r'\.[^.]+$'), '');
   }
 
-  Future<void> _initGoogleSignIn() async {
+  Future<void> _initAuth() async {
     try {
-      await _googleSignIn.initialize(serverClientId: dotenv.env['WEB_CLIENT_ID']!);
-      setState(() => _isInitialized = true);
+      if (_isDesktop) {
+        final prefs = await SharedPreferences.getInstance();
+        final refreshToken = prefs.getString('drive_refresh_token');
 
-      _googleSignIn.authenticationEvents.listen((event) {
-        setState(() {
-          _currentUser = switch (event) {
-            GoogleSignInAuthenticationEventSignIn() => event.user,
-            GoogleSignInAuthenticationEventSignOut() => null,
-          };
-        });
-        if (_currentUser != null) {
-          _fetchVideos();
-        } else {
-          _allVideoFiles.clear();
-          _displayedFiles.clear();
+        if (refreshToken != null) {
+          final clientId = auth_io.ClientId(dotenv.env['DESKTOP_CLIENT_ID']!, dotenv.env['DESKTOP_CLIENT_SECRET']!);
+          final credentials = auth_io.AccessCredentials(
+            auth_io.AccessToken('Bearer', '', DateTime.now().toUtc().subtract(const Duration(days: 1))),
+            refreshToken,
+            _scopes,
+          );
+
+          try {
+            final newCreds = await auth_io.refreshCredentials(clientId, credentials, http.Client());
+            setState(() {
+              _isAuthenticated = true;
+              _accessToken = newCreds.accessToken.data;
+            });
+            _fetchVideos();
+          } catch (e) {
+            debugPrint("Session expirée : $e");
+            await prefs.remove('drive_refresh_token');
+          }
         }
-      });
-      await _googleSignIn.attemptLightweightAuthentication();
+        setState(() => _isInitialized = true);
+      } else {
+        await _googleSignIn.initialize(serverClientId: dotenv.env['WEB_CLIENT_ID']!);
+        _googleSignIn.authenticationEvents.listen((event) async {
+          if (event is GoogleSignInAuthenticationEventSignIn) {
+            var auth = await event.user.authorizationClient.authorizationForScopes(_scopes);
+            setState(() {
+              _isAuthenticated = true;
+              _accessToken = auth?.accessToken;
+            });
+            if (_accessToken != null) _fetchVideos();
+          } else {
+            _handleSignOutState();
+          }
+        });
+        await _googleSignIn.attemptLightweightAuthentication();
+        setState(() => _isInitialized = true);
+      }
     } catch (e) {
       debugPrint("Initialization warning: $e");
+      setState(() => _isInitialized = true);
     }
   }
 
   Future<void> _handleSignIn() async {
     if (!_isInitialized) return;
+
     try {
-      await _googleSignIn.authenticate();
-      final authClient = _googleSignIn.authorizationClient;
-      var authorization = await authClient.authorizationForScopes(_scopes);
-      if (authorization == null) await authClient.authorizeScopes(_scopes);
+      if (_isDesktop) {
+        final clientId = auth_io.ClientId(dotenv.env['DESKTOP_CLIENT_ID']!, dotenv.env['DESKTOP_CLIENT_SECRET']!);
+        _desktopAuthClient = await auth_io.clientViaUserConsent(clientId, _scopes, (url) async {
+          if (!await launchUrl(Uri.parse(url))) {
+            throw Exception('Impossible d\'ouvrir le navigateur pour $url');
+          }
+        });
+
+        final refreshToken = _desktopAuthClient!.credentials.refreshToken;
+        if (refreshToken != null) {
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('drive_refresh_token', refreshToken);
+        }
+
+        setState(() {
+          _isAuthenticated = true;
+          _accessToken = _desktopAuthClient!.credentials.accessToken.data;
+        });
+        _fetchVideos();
+      } else {
+        final account = await _googleSignIn.authenticate();
+        var auth = await account.authorizationClient.authorizationForScopes(_scopes);
+        auth ??= await account.authorizationClient.authorizeScopes(_scopes);
+        setState(() {
+          _isAuthenticated = true;
+          _accessToken = auth?.accessToken;
+        });
+        _fetchVideos();
+                  }
     } catch (error) {
       debugPrint("Error signing in: $error");
     }
   }
 
   Future<void> _handleSignOut() async {
-    await _googleSignIn.disconnect();
-    setState(() => _currentUser = null);
+    if (_isDesktop) {
+      _desktopAuthClient?.close();
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('drive_refresh_token');
+    } else {
+      await _googleSignIn.disconnect();
+    }
+    _handleSignOutState();
+  }
+
+  void _handleSignOutState() {
+    setState(() {
+      _isAuthenticated = false;
+      _accessToken = null;
+      _desktopAuthClient = null;
+      _allVideoFiles.clear();
+      _displayedFiles.clear();
+    });
   }
 
   Future<void> _fetchVideos() async {
-    if (_currentUser == null) return;
+    if (!_isAuthenticated || _accessToken == null) return;
     setState(() => _isLoadingVideos = true);
 
     try {
-      final authClient = _googleSignIn.authorizationClient;
-      var authorization = await authClient.authorizationForScopes(_scopes);
-      authorization ??= await authClient.authorizeScopes(_scopes);
-
-      final headers = {'Authorization': 'Bearer ${authorization.accessToken}'};
+      final headers = {'Authorization': 'Bearer $_accessToken'};
       final client = GoogleAuthClient(headers);
       final driveApi = drive.DriveApi(client);
       final String folderId = dotenv.env['FOLDER_ID']!;
 
-      // We added modifiedTime to the requested fields so we can sort by date
       final drive.FileList fileList = await driveApi.files.list(
         q: "'$folderId' in parents and mimeType contains 'video/' and trashed=false",
         $fields: "files(id, name, mimeType, modifiedTime)",
@@ -115,7 +186,6 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
-  // --- NEW SEARCH & SORT LOGIC ---
   void _applySearchAndSort() {
     var temp = List<drive.File>.from(_allVideoFiles);
 
@@ -134,8 +204,8 @@ class _HomeScreenState extends State<HomeScreen> {
       switch (_sortMode) {
         case SortMode.titleAsc: return nameA.compareTo(nameB);
         case SortMode.titleDesc: return nameB.compareTo(nameA);
-        case SortMode.dateDesc: return dateB.compareTo(dateA); // Newest first
-        case SortMode.dateAsc: return dateA.compareTo(dateB);  // Oldest first
+        case SortMode.dateDesc: return dateB.compareTo(dateA);
+        case SortMode.dateAsc: return dateA.compareTo(dateB);
       }
     });
 
@@ -144,29 +214,21 @@ class _HomeScreenState extends State<HomeScreen> {
     });
   }
 
-  // --- TRUE SHUFFLE LOGIC ---
-  Future<void> _playTrueRandom() async {
-    if (_displayedFiles.isEmpty) return;
+  void _playTrueRandom() {
+    if (_displayedFiles.isEmpty || _accessToken == null) return;
 
-    // Create a deeply shuffled copy of whatever list we are currently looking at
     final shuffledList = List<drive.File>.from(_displayedFiles)..shuffle();
 
-    final authClient = _googleSignIn.authorizationClient;
-    final auth = await authClient.authorizationForScopes(_scopes);
-
-    if (auth != null) {
-      if (!mounted) return;
-      Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (context) => VideoPlayerScreen(
-            videoList: shuffledList,
-            currentIndex: 0, // Start at the beginning of the new shuffled list!
-            accessToken: auth.accessToken,
-          ),
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => VideoPlayerScreen(
+          videoList: shuffledList,
+          currentIndex: 0,
+          accessToken: _accessToken!,
         ),
-      );
-    }
+      ),
+    );
   }
 
   @override
@@ -175,7 +237,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: const Text('Drive Player'),
         actions: [
-          if (_currentUser != null)
+          if (_isAuthenticated)
             IconButton(
               icon: const Icon(Icons.logout),
               tooltip: 'Sign Out',
@@ -183,7 +245,7 @@ class _HomeScreenState extends State<HomeScreen> {
             )
         ],
       ),
-      floatingActionButton: (_currentUser != null && _displayedFiles.isNotEmpty)
+      floatingActionButton: (_isAuthenticated && _displayedFiles.isNotEmpty)
           ? FloatingActionButton(
         onPressed: _playTrueRandom,
         tooltip: 'Shuffle Play All',
@@ -192,7 +254,7 @@ class _HomeScreenState extends State<HomeScreen> {
           : null,
       body: !_isInitialized
           ? const Center(child: CircularProgressIndicator())
-          : _currentUser == null
+          : !_isAuthenticated
           ? Center(
         child: ElevatedButton(
           onPressed: _handleSignIn,
@@ -203,7 +265,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ? const Center(child: CircularProgressIndicator())
           : Column(
         children: [
-          // --- NEW SEARCH & SORT BAR ---
           Padding(
             padding: const EdgeInsets.all(8.0),
             child: Row(
@@ -240,7 +301,6 @@ class _HomeScreenState extends State<HomeScreen> {
               ],
             ),
           ),
-          // The Video List
           Expanded(
             child: ListView.builder(
               itemCount: _displayedFiles.length,
@@ -249,23 +309,18 @@ class _HomeScreenState extends State<HomeScreen> {
                 return ListTile(
                   leading: const Icon(Icons.play_circle_outline),
                   title: Text(_cleanName(video.name)),
-                  onTap: () async {
-                    final authClient = _googleSignIn.authorizationClient;
-                    final auth = await authClient.authorizationForScopes(_scopes);
-
-                    if (auth != null) {
-                      if (!context.mounted) return;
-                      Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (context) => VideoPlayerScreen(
-                            videoList: _displayedFiles,
-                            currentIndex: index,
-                            accessToken: auth.accessToken,
-                          ),
+                  onTap: () {
+                    if (_accessToken == null) return;
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => VideoPlayerScreen(
+                          videoList: _displayedFiles,
+                          currentIndex: index,
+                          accessToken: _accessToken!,
                         ),
-                      );
-                    }
+                      ),
+                    );
                   },
                 );
               },
