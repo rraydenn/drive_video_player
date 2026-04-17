@@ -153,36 +153,44 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       body: Center(
         child: _hasError
             ? const Text('Error loading video', style: TextStyle(color: Colors.white))
-            : Stack(
-          alignment: Alignment.center,
-          children: [
-            Video(controller: _videoController),
-            if (_showAutoplayOverlay)
-              Positioned.fill(
-                child: Container(
-                  color: Colors.black87,
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text('Next video in $_countdown...', style: const TextStyle(color: Colors.white, fontSize: 18)),
-                      const SizedBox(height: 10),
-                      Text(_cleanName(widget.videoList[_nextIndex].name),
-                          style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
-                          textAlign: TextAlign.center),
-                      const SizedBox(height: 30),
-                      Row(
+
+            : Video(
+          controller: _videoController,
+
+          controls: (state) {
+            return Stack(
+              alignment: Alignment.center,
+              children: [
+                AdaptiveVideoControls(state),
+
+                if (_showAutoplayOverlay)
+                  Positioned.fill(
+                    child: Container(
+                      color: Colors.black87,
+                      child: Column(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          OutlinedButton(onPressed: _cancelAutoplay, style: OutlinedButton.styleFrom(foregroundColor: Colors.white), child: const Text('Cancel')),
-                          const SizedBox(width: 20),
-                          ElevatedButton(onPressed: () { _autoplayTimer?.cancel(); _playTargetVideo(_nextIndex); }, child: const Text('Play Now')),
+                          Text('Next video in $_countdown...', style: const TextStyle(color: Colors.white, fontSize: 18)),
+                          const SizedBox(height: 10),
+                          Text(_cleanName(widget.videoList[_nextIndex].name),
+                              style: const TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.bold),
+                              textAlign: TextAlign.center),
+                          const SizedBox(height: 30),
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              OutlinedButton(onPressed: _cancelAutoplay, style: OutlinedButton.styleFrom(foregroundColor: Colors.white), child: const Text('Cancel')),
+                              const SizedBox(width: 20),
+                              ElevatedButton(onPressed: () { _autoplayTimer?.cancel(); _playTargetVideo(_nextIndex); }, child: const Text('Play Now')),
+                            ],
+                          )
                         ],
-                      )
-                    ],
-                  ),
-                ),
-              )
-          ],
+                      ),
+                    ),
+                  )
+              ],
+            );
+          },
         ),
       ),
     );
