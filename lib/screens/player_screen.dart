@@ -30,6 +30,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   int _countdown = 5;
   bool _showAutoplayOverlay = false;
   bool _autoplayCanceled = false;
+  double _currentSpeed = 1.0;
+  final List<double> _availableSpeeds = [0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
 
   bool get _canSkip => widget.videoList.length > 1;
   int get _nextIndex => (widget.currentIndex + 1) % widget.videoList.length;
@@ -129,6 +131,11 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     return name.replaceAll(RegExp(r'\.[^.]+$'), '');
   }
 
+  void _setPlaybackSpeed(double speed) {
+    _player.setRate(speed);
+    setState(() => _currentSpeed = speed);
+  }
+
   @override
   Widget build(BuildContext context) {
     final currentVideo = widget.videoList[widget.currentIndex];
@@ -139,6 +146,26 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         actions: [
+          PopupMenuButton<double>(
+            icon: const Icon(Icons.speed),
+            tooltip: 'Vitesse de lecture',
+            onSelected: _setPlaybackSpeed,
+            itemBuilder: (context) {
+              return _availableSpeeds.map((speed) {
+                return PopupMenuItem<double>(
+                  value: speed,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text('${speed}x'),
+                      if (_currentSpeed == speed)
+                        const Icon(Icons.check, size: 18),
+                    ],
+                  ),
+                );
+              }).toList();
+            },
+          ),
           IconButton(
             icon: const Icon(Icons.skip_previous),
             onPressed: _canSkip ? () => _playTargetVideo(_prevIndex) : null,
